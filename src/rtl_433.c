@@ -20,12 +20,23 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "rtl-sdr.h"
+#ifdef USE_HACKRF
+#include <libhackrf/hackrf.h>
+#else
 #include "rtl_433.h"
+#endif
 #include "baseband.h"
 #include "pulse_detect.h"
 #include "pulse_demod.h"
 
+#include <unistd.h>
+#include <stdio.h>
+#include <signal.h>
+#include <rtl-sdr.h>
+#include <getopt.h>
+
+extern char* optarg;
+extern int optind, opterr, optopt;
 
 static int do_exit = 0;
 static int do_exit_async = 0, frequencies = 0, events = 0;
@@ -33,8 +44,12 @@ uint32_t frequency[MAX_PROTOCOLS];
 time_t rawtime_old;
 int flag;
 uint32_t samp_rate = DEFAULT_SAMPLE_RATE;
+#ifdef USE_HACKRF
+double samp_rate_hrf = (double) 8000000;
+#endif
 static uint32_t bytes_to_read = 0;
 static rtlsdr_dev_t *dev = NULL;
+static hackrf_device* hrf_dev = NULL;
 static int override_short = 0;
 static int override_long = 0;
 int debug_output = 0;
@@ -111,12 +126,15 @@ void usage(r_device *devices) {
     exit(1);
 }
 
+volatile int call_cb = 0;
+
 #ifdef _WIN32
 BOOL WINAPI
 sighandler(int signum) {
     if (CTRL_C_EVENT == signum) {
         fprintf(stderr, "Signal caught, exiting!\n");
         do_exit = 1;
+
         rtlsdr_cancel_async(dev);
         return TRUE;
     }
@@ -127,10 +145,14 @@ static void sighandler(int signum) {
     if (signum == SIGPIPE) {
         signal(SIGPIPE,SIG_IGN);
     } else {
-        fprintf(stderr, "Signal caught, exiting!\n");
+      fprintf(stderr, "Signal caught, exiting! %d\n",call_cb/2);
     }
     do_exit = 1;
+#ifdef USE_HACKRF
+    hackrf_stop_rx(hrf_dev);
+#else
     rtlsdr_cancel_async(dev);
+#endif
 }
 #endif
 
@@ -614,12 +636,30 @@ static void pwm_p_decode(struct dm_state *demod, struct protocol_state* p, int16
 }
 
 
+
+#ifdef USE_HACKRF
+static int hackrf_rx_callback(hackrf_transfer* transfer){
+  hackrf_device* hrf_dev = transfer->device;
+  unsigned char *iq_buf = transfer->buffer;
+  uint32_t len = transfer->valid_length;
+  struct dm_state *demod = transfer->rx_ctx;
+  /*   call_cb++;
+  printf("hrf cb %d,%d\n",len,bytes_to_read);
+  fflush(NULL);
+  */
+#else
 static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
     struct dm_state *demod = ctx;
+#endif
+
     int i;
 
-	if (do_exit || do_exit_async)
-		return;
+    if (do_exit || do_exit_async)
+#ifdef USE_HACKRF
+      return 1;
+#else
+    return;
+#endif
 
 	if ((bytes_to_read > 0) && (bytes_to_read < len)) {
 		len = bytes_to_read;
@@ -652,7 +692,7 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
 			fprintf(stderr, "Reading FM modulated data not implemented yet!\n");
 		}
 	}
-
+	
 	if (demod->analyze || (demod->out_file == stdout)) {	// We don't want to decode devices when outputting to stdout
 		pwm_analyze(demod, demod->am_buf, len / 2);
 	} else {
@@ -681,12 +721,17 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
 		// Detect a package and loop through demodulators with pulse data
 		int package_type = 1;	// Just to get us started
 		while(package_type) {
-			package_type = detect_pulse_package(demod->am_buf, demod->fm_buf, len/2, demod->level_limit, samp_rate, &demod->pulse_data, &demod->fsk_pulse_data);
+		  package_type = detect_pulse_package(demod->am_buf, demod->fm_buf, len/2, demod->level_limit, samp_rate, &demod->pulse_data, &demod->fsk_pulse_data);
+		  
+		  
+		  /*	  printf("hrf pack cb %d\n",package_type);
+			  fflush(NULL);*/
+			
 			if (package_type == 1) {
 				if(demod->analyze_pulses) fprintf(stderr, "Detected OOK package\n");
 				for (i = 0; i < demod->r_dev_num; i++) {
 					switch (demod->r_devs[i]->modulation) {
-						// Old style decoders
+					// Old style decoders
 						case OOK_PWM_D:
 						case OOK_PWM_P:
 							break;
@@ -718,7 +763,9 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
 				if(debug_output > 1) pulse_data_print(&demod->pulse_data);
 				if(demod->analyze_pulses) pulse_analyzer(&demod->pulse_data);
 			} else if (package_type == 2) {
+			  // printf("!! PACK 2!\n");
 				if(demod->analyze_pulses) fprintf(stderr, "Detected FSK package\n");
+				if(debug_output > 1) pulse_data_print(&demod->pulse_data);
 				for (i = 0; i < demod->r_dev_num; i++) {
 					switch (demod->r_devs[i]->modulation) {
 						// Old style decoders + OOK decoders
@@ -770,6 +817,12 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
 			rtlsdr_cancel_async(dev);
 		}
 	}
+#ifdef USE_HACKRF
+	/*	call_cb++;
+	printf("hrf ret cb %d\n",len);
+	fflush(NULL);*/
+	return 0;
+#endif
 }
 
 int main(int argc, char **argv) {
@@ -915,9 +968,17 @@ int main(int argc, char **argv) {
     }
 
     buffer = malloc(out_block_size * sizeof (uint8_t));
-
+ 
     if (!in_filename) {
-	device_count = rtlsdr_get_device_count();
+
+#ifdef USE_HACKRF
+      hackrf_init();
+     
+      hackrf_device_list_t * hack_rf_dev_lst = hackrf_device_list();
+      device_count = hack_rf_dev_lst->devicecount;
+#else
+      device_count = rtlsdr_get_device_count();
+#endif
 	if (!device_count) {
 	    fprintf(stderr, "No supported devices found.\n");
 	    if (!in_filename)
@@ -926,19 +987,43 @@ int main(int argc, char **argv) {
 
 	fprintf(stderr, "Found %d device(s):\n", device_count);
 	for (i = 0; i < device_count; i++) {
+#ifdef USE_HACKRF
+	  uint8_t num_ser;
+	  read_partid_serialno_t read_partid_serialno;
+	  hackrf_device_list_open(hack_rf_dev_lst,i,&hrf_dev);
+	  hackrf_board_partid_serialno_read(hrf_dev, &read_partid_serialno);
+	  // hackrf_version_string_read(hrf_dev,serial,(uint8_t)256); -> MAKE IT BUG !!!
+	  fprintf(stderr, "  %d:  %s, 0x%x(%s), SN: 0x%x 0x%x 0x%x 0x%x v.:%s\n", i,
+		  "Great Scott Gadget",
+		  hack_rf_dev_lst->usb_board_ids[i],
+		  hackrf_usb_board_id_name(hack_rf_dev_lst->usb_board_ids[i]),
+		  read_partid_serialno.serial_no[0],
+		  read_partid_serialno.serial_no[1],
+		  read_partid_serialno.serial_no[2],
+		  read_partid_serialno.serial_no[3],
+		  serial);
+	  //	  hackrf_close(hrf_dev);
+#else	  
 	    rtlsdr_get_device_usb_strings(i, vendor, product, serial);
 	    fprintf(stderr, "  %d:  %s, %s, SN: %s\n", i, vendor, product, serial);
+#endif
 	}
 	fprintf(stderr, "\n");
 
-	fprintf(stderr, "Using device %d: %s\n",
-		dev_index, rtlsdr_get_device_name(dev_index));
 
+#ifdef USE_HACKRF
+	fprintf(stderr, "Using device %d:0x%0x\n",dev_index,hack_rf_dev_lst->usb_board_ids[dev_index]);
+	//	hackrf_device_list_open(hack_rf_dev_lst,dev_index,&hrf_dev);
+
+#else	  		
+	fprintf(stderr, "Using device %d:%s\n",dev_index,rtlsdr_get_device_name(dev_index));
 	r = rtlsdr_open(&dev, dev_index);
 	if (r < 0) {
 	    fprintf(stderr, "Failed to open rtlsdr device #%d.\n", dev_index);
 	    exit(1);
 	}
+#endif
+	
 #ifndef _WIN32
 	sigact.sa_handler = sighandler;
 	sigemptyset(&sigact.sa_mask);
@@ -950,15 +1035,68 @@ int main(int argc, char **argv) {
 #else
 	SetConsoleCtrlHandler((PHANDLER_ROUTINE) sighandler, TRUE);
 #endif
+
+
+	
 	/* Set the sample rate */
+
+#ifdef USE_HACKRF
+	r =hackrf_set_sample_rate(hrf_dev,samp_rate_hrf);
+#else	  	
 	r = rtlsdr_set_sample_rate(dev, samp_rate);
-	if (r < 0)
-	    fprintf(stderr, "WARNING: Failed to set sample rate.\n");
+
+#endif
+	if (r < 0){
+	  fprintf(stderr, "WARNING: Failed to set sample rate.\n");
+	  hackrf_close(hrf_dev);
+	  hackrf_exit();
+	  exit(1);
+	}
 	else
-	    fprintf(stderr, "Sample rate set to %d.\n", rtlsdr_get_sample_rate(dev)); // Unfortunately, doesn't return real rate
-
+#ifdef USE_HACKRF
+	  fprintf(stderr, "Sample rate set to %f.\n",samp_rate_hrf);
+#else
+	  fprintf(stderr, "Sample rate set to %d.\n", rtlsdr_get_sample_rate(dev)); // Unfortunately, doesn't return real rate
+#endif	
 	fprintf(stderr, "Bit detection level set to %d.\n", demod->level_limit);
+    
 
+#ifdef USE_HACKRF
+
+	hackrf_set_baseband_filter_bandwidth(hrf_dev, 250000);
+	
+	printf("gain :%d\n",gain);
+
+	if (0 == gain) {
+	  /* use default values in OSMOCOM 
+	     amp ON 
+	     RF :      10dB
+	     IF(lna) : 20dB -> 2 (16dB)
+	     BB(vga) : 20dB -> 10
+	     
+	  */
+	  r=0;
+	  r =  hackrf_set_amp_enable(hrf_dev, 0);
+	  printf("r1 :%d\n",r);
+	  r |= hackrf_set_lna_gain(hrf_dev,(uint32_t) 16);/* 8dB steps, cf. hackrf-kalibrate*/
+	  printf("r2 :%d\n",r);
+
+	  
+	  r |= hackrf_set_vga_gain(hrf_dev,(uint32_t) 20);     /* 2dB steps, cf. hackrf-kalibrate*/
+	  printf("r3 :%d\n",r);
+
+	  fflush(NULL);
+	  
+	
+	  if(r!=0){
+	    fprintf(stderr, "WARNING: Failed to set gain.\n");
+	    hackrf_stop_rx(hrf_dev);
+	    hackrf_close(hrf_dev);
+	    hackrf_exit();
+	    exit(1);
+	  }
+	}
+#else	
 	if (0 == gain) {
 	    /* Enable automatic gain */
 	    r = rtlsdr_set_tuner_gain_mode(dev, 0);
@@ -982,8 +1120,9 @@ int main(int argc, char **argv) {
 
 	r = rtlsdr_set_freq_correction(dev, ppm_error);
 
+    
+#endif
     }
-
 	if (out_filename) {
 		if (strcmp(out_filename, "-") == 0) { /* Write samples to stdout */
 			demod->out_file = stdout;
@@ -1001,10 +1140,18 @@ int main(int argc, char **argv) {
 
     if (demod->signal_grabber)
         demod->sg_buf = malloc(SIGNAL_GRABBER_BUFFER);
-
+       unsigned char test_mode_buf[DEFAULT_BUF_LENGTH];
+#ifdef USE_HACKRF
+     hackrf_transfer test_trans;
+	  test_trans.device = hrf_dev;
+	  test_trans.buffer = test_mode_buf;
+	  test_trans.buffer_length =  test_trans.valid_length = 131072;
+	  test_trans.rx_ctx = demod;
+#endif    
+    
     if (in_filename) {
         int i = 0;
-        unsigned char test_mode_buf[DEFAULT_BUF_LENGTH];
+     
         fprintf(stderr, "Test mode active. Reading samples from file: %s\n", in_filename);
         in_file = fopen(in_filename, "r");
         if (!in_file) {
@@ -1012,25 +1159,39 @@ int main(int argc, char **argv) {
             goto out;
         }
         while (fread(test_mode_buf, 131072, 1, in_file) != 0) {
-            rtlsdr_callback(test_mode_buf, 131072, demod);
-            i++;
+#ifdef USE_HACKRF
+	  
+	  //rtlsdr_callback(test_mode_buf, 131072, demod);
+	   hackrf_rx_callback(&test_trans); 
+#else
+	  rtlsdr_callback(test_mode_buf, 131072, demod);
+#endif
+	   i++;
         }
 
         // Call a last time with cleared samples to ensure EOP detection
         memset(test_mode_buf, 128, DEFAULT_BUF_LENGTH);     // 128 is 0 in unsigned data
+#ifdef USE_HACKRF
+	  //rtlsdr_callback(test_mode_buf, 131072, demod);
+	   hackrf_rx_callback(&test_trans);
+#else	
         rtlsdr_callback(test_mode_buf, 131072, demod);      // Why the magic value 131072?
-
+#endif
         //Always classify a signal at the end of the file
         classify_signal();
         fprintf(stderr, "Test mode file issued %d packets\n", i);
         exit(0);
     }
 
-    /* Reset endpoint before we start reading from it (mandatory) */
+   
+
+#ifndef USE_HACKRF
+     /* Reset endpoint before we start reading from it (mandatory) */
     r = rtlsdr_reset_buffer(dev);
     if (r < 0)
         fprintf(stderr, "WARNING: Failed to reset buffers.\n");
 
+    
     if (sync_mode) {
         fprintf(stderr, "Reading samples in sync mode...\n");
         while (!do_exit) {
@@ -1065,22 +1226,50 @@ int main(int argc, char **argv) {
         } else {
             time(&rawtime_old);
         }
+#else
+	/*no sync mode w/ hackrflib */
+	time(&rawtime_old);
+#endif
+
+	 if (frequencies == 0) {
+            frequency[0] = DEFAULT_FREQUENCY;
+            frequencies = 1;
+        } else {
+            time(&rawtime_old);
+        }
+	 int old_frequency_current = -1;
         fprintf(stderr, "Reading samples in async mode...\n");
         while (!do_exit) {
             /* Set the frequency */
+#ifdef USE_HACKRF
+	  if(old_frequency_current!=frequency_current){
+	    r=hackrf_set_freq(hrf_dev,frequency[frequency_current] );
+	   
+	  }
+#else	  
             r = rtlsdr_set_center_freq(dev, frequency[frequency_current]);
+#endif
             if (r < 0)
                 fprintf(stderr, "WARNING: Failed to set center freq.\n");
             else
-                fprintf(stderr, "Tuned to %u Hz.\n", rtlsdr_get_center_freq(dev));
-            r = rtlsdr_read_async(dev, rtlsdr_callback, (void *) demod,
-                    DEFAULT_ASYNC_BUF_NUMBER, out_block_size);
+#ifdef USE_HACKRF
+	      if (frequencies != 1) 
+		fprintf(stderr, "Tuned to %u Hz.\n", frequency[frequency_current]);
+	     if(old_frequency_current!=frequency_current){
+	    r = hackrf_start_rx(hrf_dev, hackrf_rx_callback , (void *) demod);
+	     old_frequency_current=frequency_current;
+	  }
+#else	  
+	      fprintf(stderr, "Tuned to %u Hz.\n", rtlsdr_get_center_freq(dev));
+            r = rtlsdr_read_async(dev, rtlsdr_callback, (void *) demod,DEFAULT_ASYNC_BUF_NUMBER, out_block_size);
+#endif
             do_exit_async = 0;
             frequency_current++;
             if (frequency_current > frequencies - 1) frequency_current = 0;
         }
+#ifndef USE_HACKRF
     }
-
+#endif
     if (do_exit)
         fprintf(stderr, "\nUser cancel, exiting...\n");
     else
@@ -1098,8 +1287,15 @@ int main(int argc, char **argv) {
     if (demod)
         free(demod);
 
-    rtlsdr_close(dev);
+  
     free(buffer);
+    
+#ifdef USE_HACKRF
+    hackrf_close(hrf_dev);
+    hackrf_exit();
+#else
+    rtlsdr_close(dev);
+#endif
 out:
     return r >= 0 ? r : -r;
 }
